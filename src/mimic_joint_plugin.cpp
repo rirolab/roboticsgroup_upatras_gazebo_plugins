@@ -30,8 +30,7 @@ namespace math = gazebo::math;
 
 namespace gazebo {
 
-    MimicJointPlugin::MimicJointPlugin()
-    {
+    MimicJointPlugin::MimicJointPlugin(){
         joint_.reset();
         mimic_joint_.reset();
     }
@@ -39,6 +38,7 @@ namespace gazebo {
     MimicJointPlugin::~MimicJointPlugin()
     {
         update_connection_.reset();
+        delete pid_ros_;
     }
 
     void MimicJointPlugin::Load(physics::ModelPtr _parent, sdf::ElementPtr _sdf)
@@ -48,13 +48,13 @@ namespace gazebo {
 
         // Error message if the model couldn't be found
         if (!model_) {
-            ROS_ERROR("Parent model is NULL! MimicJointPlugin could not be loaded.");
+            RCLCPP_ERROR(rclcpp::get_logger("roboticsgroup_upatras_gazebo_mimic_joint_plugin"), "Parent model is NULL! MimicJointPlugin could not be loaded.");
             return;
         }
 
         // Check that ROS has been initialized
-        if (!ros::isInitialized()) {
-            ROS_ERROR("A ROS node for Gazebo has not been initialized, unable to load plugin.");
+        if (!rclcpp::ok()) {
+            RCLCPP_ERROR(rclcpp::get_logger("roboticsgroup_upatras_gazebo_mimic_joint_plugin"), "A ROS node for Gazebo has not been initialized, unable to load plugin.");
             return;
         }
 
@@ -62,11 +62,14 @@ namespace gazebo {
         if (_sdf->HasElement("robotNamespace")) {
             robot_namespace_ = _sdf->GetElement("robotNamespace")->Get<std::string>();
         }
-        ros::NodeHandle model_nh(robot_namespace_);
+
+        // Set up ROS node
+        //ros_node_ = gazebo_ros::Node::Get(robot_namespace_ );
+        ros_node_ = gazebo_ros::Node::Get(_sdf);
 
         // Check for joint element
         if (!_sdf->HasElement("joint")) {
-            ROS_ERROR("No joint element present. MimicJointPlugin could not be loaded.");
+            RCLCPP_ERROR(ros_node_->get_logger(), "No joint element present. MimicJointPlugin could not be loaded.");
             return;
         }
 
@@ -74,7 +77,7 @@ namespace gazebo {
 
         // Check for mimicJoint element
         if (!_sdf->HasElement("mimicJoint")) {
-            ROS_ERROR("No mimicJoint element present. MimicJointPlugin could not be loaded.");
+            RCLCPP_ERROR(ros_node_->get_logger(), "No mimicJoint element present. MimicJointPlugin could not be loaded.");
             return;
         }
 
@@ -87,8 +90,10 @@ namespace gazebo {
             if (name.empty()) {
                 name = "gazebo_ros_control/pid_gains/" + mimic_joint_name_;
             }
-            const ros::NodeHandle nh(model_nh, name);
-            pid_.init(nh);
+            
+            // PID controller if needed
+            rclcpp::Node::SharedPtr node_ros2 = std::dynamic_pointer_cast<rclcpp::Node>(ros_node_);
+            pid_ros_ = new control_toolbox::PidROS(node_ros2, name);
         }
 
         // Check for multiplier element
@@ -109,12 +114,12 @@ namespace gazebo {
         // Get pointers to joints
         joint_ = model_->GetJoint(joint_name_);
         if (!joint_) {
-            ROS_ERROR_STREAM("No joint named \"" << joint_name_ << "\". MimicJointPlugin could not be loaded.");
+            RCLCPP_ERROR_STREAM(ros_node_->get_logger(), "No joint named \"" << joint_name_ << "\". MimicJointPlugin could not be loaded.");
             return;
         }
         mimic_joint_ = model_->GetJoint(mimic_joint_name_);
         if (!mimic_joint_) {
-            ROS_ERROR_STREAM("No (mimic) joint named \"" << mimic_joint_name_ << "\". MimicJointPlugin could not be loaded.");
+            RCLCPP_ERROR_STREAM(ros_node_->get_logger(), "No (mimic) joint named \"" << mimic_joint_name_ << "\". MimicJointPlugin could not be loaded.");
             return;
         }
 
@@ -142,20 +147,23 @@ namespace gazebo {
         update_connection_ = event::Events::ConnectWorldUpdateBegin(
             boost::bind(&MimicJointPlugin::UpdateChild, this));
 
+        //mimic_joint_->SetPosition(0, 1, true);
+
+        
         // Output some confirmation
-        ROS_INFO_STREAM("MimicJointPlugin loaded! Joint: \"" << joint_name_ << "\", Mimic joint: \"" << mimic_joint_name_ << "\""
+        RCLCPP_INFO_STREAM(ros_node_->get_logger(), "MimicJointPlugin loaded! Joint: \"" << joint_name_ << "\", Mimic joint: \"" << mimic_joint_name_ << "\""
                                                              << ", Multiplier: " << multiplier_ << ", Offset: " << offset_
-                                                             << ", MaxEffort: " << max_effort_ << ", Sensitiveness: " << sensitiveness_);
+                           << ", MaxEffort: " << max_effort_ << ", Sensitiveness: " << sensitiveness_);
     }
 
     void MimicJointPlugin::UpdateChild()
     {
 #if GAZEBO_MAJOR_VERSION >= 8
-        static ros::Duration period(world_->Physics()->GetMaxStepSize());
+        static rclcpp::Duration period(world_->Physics()->GetMaxStepSize());
 #else
-        static ros::Duration period(world_->GetPhysicsEngine()->GetMaxStepSize());
+        static rclcpp::Duration period(world_->GetPhysicsEngine()->GetMaxStepSize());
 #endif
-
+        
         // Set mimic joint's angle based on joint's angle
 #if GAZEBO_MAJOR_VERSION >= 8
         double angle = joint_->Position(0) * multiplier_ + offset_;
@@ -165,25 +173,28 @@ namespace gazebo {
         double a = mimic_joint_->GetAngle(0).Radian();
 #endif
 
+        
         if (fabs(angle - a) >= sensitiveness_) {
-            if (has_pid_) {
+            if (has_pid_) {                
                 if (a != a)
                     a = angle;
                 double error = angle - a;
-                double effort = math::clamp(pid_.computeCommand(error, period), -max_effort_, max_effort_);
+                double effort = math::clamp(pid_ros_->computeCommand(error, period), -max_effort_, max_effort_);
                 mimic_joint_->SetForce(0, effort);
             }
             else {
+                
 #if GAZEBO_MAJOR_VERSION >= 9
                 mimic_joint_->SetPosition(0, angle, true);
+                // RCLCPP_ERROR_STREAM(ros_node_->get_logger(), "Joint: " << mimic_joint_name_ << " angle: " << angle << " curang: "<< a << " has_pid: " << has_pid_ );                
 #elif GAZEBO_MAJOR_VERSION > 2
-                ROS_WARN_ONCE("The mimic_joint plugin is using the Joint::SetPosition method without preserving the link velocity.");
-                ROS_WARN_ONCE("As a result, gravity will not be simulated correctly for your model.");
-                ROS_WARN_ONCE("Please set gazebo_pid parameters or upgrade to Gazebo 9.");
-                ROS_WARN_ONCE("For details, see https://github.com/ros-simulation/gazebo_ros_pkgs/issues/612");
+                RCLCPP_WARN_ONCE(ros_node_->get_logger(), "The mimic_joint plugin is using the Joint::SetPosition method without preserving the link velocity.");
+                RCLCPP_WARN_ONCE(ros_node_->get_logger(), "As a result, gravity will not be simulated correctly for your model.");
+                RCLCPP_WARN_ONCE(ros_node_->get_logger(), "Please set gazebo_pid parameters or upgrade to Gazebo 9.");
+                RCLCPP_WARN_ONCE(ros_node_->get_logger(), "For details, see https://github.com/ros-simulation/gazebo_ros_pkgs/issues/612");
                 mimic_joint_->SetPosition(0, angle);
 #else
-                mimic_joint_->SetAngle(0, math::Angle(angle));
+                mimic_joint_->SetAngle(0, math::Angle(angle));                
 #endif
             }
         }
