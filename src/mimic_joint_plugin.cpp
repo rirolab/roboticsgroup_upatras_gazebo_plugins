@@ -200,6 +200,6 @@ namespace gazebo {
         }
     }
 
-    GZ_REGISTER_MODEL_PLUGIN(MimicJointPlugin);
+    GZ_REGISTER_MODEL_PLUGIN(MimicJointPlugin)
 
 }  // namespace gazebo
